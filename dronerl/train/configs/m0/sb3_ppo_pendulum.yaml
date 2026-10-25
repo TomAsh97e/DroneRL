@@ -1,0 +1,19 @@
+# rl-baselines3-zoo hyperparams/ppo.yml (Pendulum-v1), plus VecNormalize as required by plan/M0.md
+algo: ppo
+env_id: Pendulum-v1
+exp: m0/main
+variant: sb3_ppo
+total_steps: 100000
+n_envs: 4
+normalize: true
+eval_every: 5000
+params:
+  n_steps: 1024
+  gae_lambda: 0.95
+  gamma: 0.9
+  n_epochs: 10
+  ent_coef: 0.0
+  learning_rate: 1.0e-3
+  clip_range: 0.2
+  use_sde: true
+  sde_sample_freq: 4

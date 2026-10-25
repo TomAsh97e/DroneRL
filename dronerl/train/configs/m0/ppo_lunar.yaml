@@ -1,0 +1,14 @@
+# Based on rl-baselines3-zoo hyperparams/ppo.yml (LunarLanderContinuous-v3)
+env_id: LunarLander-v3
+env_kwargs: {continuous: true}
+exp: m0/main
+variant: ppo
+total_steps: 1000000
+num_envs: 16
+num_steps: 1024
+num_minibatches: 256
+update_epochs: 4
+gamma: 0.999
+gae_lambda: 0.98
+ent_coef: 0.01
+eval_every: 50000

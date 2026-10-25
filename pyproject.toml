@@ -1,0 +1,48 @@
+[project]
+name = "dronerl"
+version = "0.1.0"
+description = "Vision-based drone navigation learned with reinforcement learning"
+authors = [
+    { name = "TomAsh97e", email = "tomek.zycki97@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "gym-pybullet-drones",
+    "gymnasium[box2d,classic-control]>=1.4.0",
+    "imageio[ffmpeg]>=2.38.1",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "optuna==5.0.0",
+    "pyyaml>=6.0.3",
+    "rsl-rl-lib==5.5.1",
+    "stable-baselines3>=2.9.0",
+    "tensorboard>=2.21.0",
+    "torch>=2.14.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.22,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+[tool.uv.sources]
+gym-pybullet-drones = { git = "https://github.com/learnsyslab/gym-pybullet-drones", rev = "f83fbdd4ee1c07e1afa52694963f3a9a889a0f56" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: long-running tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.17.2",
+]

@@ -1,0 +1,6 @@
+# Defaults of the Config dataclass follow CleanRL dqn.py
+env_id: CartPole-v1
+exp: m0/main
+variant: dqn
+total_steps: 500000
+eval_every: 10000

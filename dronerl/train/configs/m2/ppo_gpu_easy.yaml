@@ -1,0 +1,20 @@
+# plan/M2.md, M2.6: own PPO on the easy level, no curriculum
+exp: m2/m2.6
+variant: ppo_gpu
+total_steps: 30000000
+num_envs: 2048
+num_steps: 32
+update_epochs: 5
+num_minibatches: 4
+learning_rate: 3.0e-4
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+ent_coef: 0.005
+vf_coef: 0.5
+max_grad_norm: 1.0
+init_std: 0.5
+level: 2
+curriculum: false
+mix: 0.0
+eval_every: 2000000

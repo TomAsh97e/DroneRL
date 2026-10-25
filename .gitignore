@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environment and tool caches
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Experiment outputs: generated maps, checkpoints, TensorBoard logs, videos, Optuna studies
+runs/
+
+# IDEs and OS
+.idea/
+.vscode/
+cmake-build-*/
+.DS_Store
