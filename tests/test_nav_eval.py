@@ -13,6 +13,9 @@ def test_baselines_on_validation_maps(tmp_path):
     astar = nav_eval.evaluate("astar", "val", levels, "cpu", tmp_path, plots=True)
     straight = nav_eval.evaluate("straight", "val", levels, "cpu", tmp_path, video=2, failures=True)
     assert astar["levels"]["hard"]["success_rate"] == 1.0
+    # per-step metrics need copies of the state, not views of the live CPU tensors
+    assert astar["levels"]["hard"]["mean_action_change"] > 0
+    assert astar["levels"]["hard"]["off_fov"] is not None
     # the straight line is blocked on every map
     assert straight["levels"]["hard"]["success_rate"] < 0.05
     assert len(astar["episodes"]["hard"]) == mapgen.SIZES["val"]

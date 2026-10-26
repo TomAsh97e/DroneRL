@@ -56,8 +56,10 @@ def objective(trial, base, steps, evals):
     history = []
 
     def report(step, row):
+        # by evaluation number: trials with another num_steps evaluate at other env steps,
+        # and the pruner compares trials only at equal steps
         history.append(row["success_rate"])
-        trial.report(row["success_rate"], step)
+        trial.report(row["success_rate"], len(history))
         if trial.should_prune():
             raise optuna.TrialPruned()
 
@@ -70,9 +72,11 @@ def summary(study, out, top=10):
     done = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     done.sort(key=lambda t: -t.value)
     pruned = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
+    failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
     names = list(SPACE)
     lines = [
-        f"Triale: {len(study.trials)}, ukończone: {len(done)}, przycięte: {len(pruned)}",
+        f"Triale: {len(study.trials)}, ukończone: {len(done)}, przycięte: {len(pruned)}, "
+        f"nieudane: {len(failed)}",
         "",
         "| trial | SR walidacja | " + " | ".join(names) + " |",
         "|---|---|" + "---|" * len(names),
@@ -119,8 +123,10 @@ def main(argv=None):
 
     base = dataclasses.replace(load_config(ppo_gpu.Config, args.config), exp="m2/m2.8")
     args.out.mkdir(parents=True, exist_ok=True)
-    # early SR says little, the curriculum starts on easy levels
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=int(0.3 * args.steps))
+    # early SR says little, the curriculum starts on easy levels: nothing is pruned within the
+    # first 30% of the budget
+    warmup = round(0.3 * args.evals) + 1
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=warmup)
     study = optuna.create_study(
         study_name=args.study,
         storage=f"sqlite:///{args.out / 'study.db'}",
@@ -129,15 +135,17 @@ def main(argv=None):
         pruner=pruner,
         load_if_exists=True,
     )
-    left = args.trials - sum(t.state.is_finished() for t in study.trials)
     if not study.trials:
         # the starting configuration as trial 0, a reference under the same budget
         study.enqueue_trial({k: getattr(base, k) for k in SPACE})
-    if left > 0:
+    counted = (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+    if sum(t.state in counted for t in study.trials) < args.trials:
         study.optimize(
             lambda t: objective(t, base, args.steps, args.evals),
-            n_trials=left,
             timeout=args.hours * 3600,
+            # 64 steps with 2 minibatches does not fit in 8 GB: such trials fail and do not count
+            catch=(torch.OutOfMemoryError,),
+            callbacks=[optuna.study.MaxTrialsCallback(args.trials, states=counted)],
         )
     summary(study, args.out)
 

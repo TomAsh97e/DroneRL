@@ -63,17 +63,22 @@ def load_policy(spec, device):
     raise ValueError(f"unknown policy: {spec}")
 
 
+def snap(x):
+    # on a CPU env .cpu() returns the live tensor, which step() then overwrites
+    return x.to("cpu", copy=True)
+
+
 @torch.no_grad()
 def rollout(env, act, frames=()):
     """Plays one episode per env; `frames` lists envs whose depth images are kept."""
     obs = env.reset()
-    pos, yaw, actions, alive, depth = [env.pos.cpu()], [env.yaw.cpu()], [], [], []
+    pos, yaw, actions, alive, depth = [snap(env.pos)], [snap(env.yaw)], [], [], []
     result = {k: torch.zeros(env.num_envs, dtype=torch.bool) for k in OUTCOMES}
     stats = {}
     while env.alive.any():
         if len(frames):
             depth.append(obs["depth"][list(frames), 0].cpu())
-        alive.append(env.alive.cpu())
+        alive.append(snap(env.alive))
         a = act(obs).clamp(-1, 1)
         obs, _, terminated, truncated, info = env.step(a)
         done = (terminated | truncated).cpu()
@@ -82,8 +87,8 @@ def rollout(env, act, frames=()):
         for key in ("length", "return", "path_length", "min_clearance"):
             stats.setdefault(key, torch.zeros(env.num_envs))[done] = info[key].cpu()[done].float()
         actions.append(a.cpu())
-        pos.append(env.pos.cpu())
-        yaw.append(env.yaw.cpu())
+        pos.append(snap(env.pos))
+        yaw.append(snap(env.yaw))
     out = {k: v.numpy() for k, v in {**result, **stats}.items()}
     out.update(pos=torch.stack(pos).numpy(), yaw=torch.stack(yaw).numpy())
     out.update(actions=torch.stack(actions).numpy(), alive=torch.stack(alive).numpy())

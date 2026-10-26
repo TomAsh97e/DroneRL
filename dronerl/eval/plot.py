@@ -62,7 +62,7 @@ def table(groups, metric="mean_return"):
     lines = [row(COLUMNS), row(["---"] * len(COLUMNS))]
     for name, runs in groups.items():
         runs = sorted(runs, key=lambda r: r["seed"])
-        done = [r for r in runs if r["final"]]
+        done = [r for r in runs if r["final"] and metric in r["final"]]
         finals = [r["final"][metric] for r in done]
         per_seed = ", ".join(f"s{r['seed']}: {r['final'][metric]:.{digits}f}" for r in done)
         cells = [
