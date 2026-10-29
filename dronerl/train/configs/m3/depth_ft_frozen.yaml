@@ -1,0 +1,4 @@
+# plan/M3.md, M3.4: neck and head only
+exp: m3/depth_ft
+variant: frozen
+encoder_lr_ratio: 0.0

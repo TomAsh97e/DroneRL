@@ -1,0 +1,4 @@
+# plan/M3.md, M3.4: whole model, encoder with a 10x smaller learning rate
+exp: m3/depth_ft
+variant: full
+encoder_lr_ratio: 0.1

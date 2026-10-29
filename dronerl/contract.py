@@ -1,14 +1,15 @@
-"""Interface contract v1 (PLAN.md, section 2.5): the one definition of observations and actions.
+"""Interface contract (PLAN.md, section 2.5): the one definition of observations and actions.
 
 Simulators, evaluation and later the ROS 2 nodes import it. Any change means a new VERSION and
-retraining.
+retraining. v2 (plan/M3.md) adds the student image with a validity mask; the teacher keeps the
+one-channel v1 image, it exists only in simulation.
 """
 
 import math
 
 import torch
 
-VERSION = 1
+VERSION = 2
 
 CTRL_HZ = 10
 DT = 1 / CTRL_HZ
@@ -25,6 +26,8 @@ IMG_H, IMG_W = 48, 64
 HFOV = math.radians(90)
 FOCAL = IMG_W / 2 / math.tan(HFOV / 2)
 DEPTH_MIN, DEPTH_MAX = 0.2, 8.0
+# student image: inverse depth and validity mask, so a hole of a depth camera is not "far"
+STUDENT_CHANNELS = 2
 
 STATE_DIM = 10
 # privileged teacher input, exists only in simulation
@@ -68,6 +71,17 @@ def encode_depth(d):
     No hit (inf) and d >= DEPTH_MAX give 0, d <= DEPTH_MIN gives 1.
     """
     return ((1 / d - 1 / DEPTH_MAX) / (1 / DEPTH_MIN - 1 / DEPTH_MAX)).clamp(0, 1)
+
+
+def encode_student_depth(d):
+    """Metric depth [..., H, W] -> student image [..., 2, H, W]: inverse depth and validity mask.
+
+    NaN marks missing data (holes, out of range of a depth camera, cropped borders) and gives 0 in
+    both channels. inf and d >= DEPTH_MAX are a valid "far" reading.
+    """
+    valid = ~torch.isnan(d)
+    depth = encode_depth(torch.where(valid, d, math.inf))
+    return torch.stack([depth, valid.to(depth.dtype)], -3)
 
 
 def decode_depth(v):

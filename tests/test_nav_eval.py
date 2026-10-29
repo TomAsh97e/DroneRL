@@ -1,10 +1,11 @@
+import pytest
 import yaml
 from rsl_rl.models import CNNModel
 
 from dronerl.agents import ppo_gpu
 from dronerl.envs import maps as mapgen
 from dronerl.envs.nav_gpu import NavEnv
-from dronerl.eval import nav_eval
+from dronerl.eval import nav_eval, student_compare
 from dronerl.train import rsl_rl_baseline
 
 
@@ -48,3 +49,11 @@ def test_trained_policies_from_run_directories(tmp_path):
     assert all(r["latency_ms"]["cpu_1_thread"] > 0 for r in results)
     text = nav_eval.table(results)
     assert "| own | empty | 1 |" in text and "| rsl s3 |" in text
+
+
+def test_student_ratios():
+    def result(variant, sr):
+        return {"variant": variant, "levels": {"medium": {"success_rate": sr}}}
+
+    results = [result("curriculum_rand", 0.8), result("main", 0.6), result("main", 0.8)]
+    assert student_compare.ratios(results)["main"]["medium"] == pytest.approx([0.75, 1.0])

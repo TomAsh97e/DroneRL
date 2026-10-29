@@ -1,6 +1,6 @@
 # DroneRL: plan projektu
 
-Wersja 1.1, 2026-10-24. Etapy mają identyfikatory M0-M7, raporty etapów odwołują się do tych identyfikatorów. Szczegółowe plany etapów są w katalogu `plan/` (`plan/M0.md`, `plan/M1.md`, `plan/M2.md`) i rozwijają odpowiednie sekcje tego dokumentu.
+Wersja 1.1, 2026-10-24. Etapy mają identyfikatory M0-M7, raporty etapów odwołują się do tych identyfikatorów. Szczegółowe plany etapów są w katalogu `plan/` (`plan/M0.md`, `plan/M1.md`, `plan/M2.md`, `plan/M3.md`, `plan/M4.md`) i rozwijają odpowiednie sekcje tego dokumentu.
 
 ## 1. Cel
 
@@ -275,6 +275,8 @@ Czego się uczysz: projektowanie środowisk RL, wektoryzacja na GPU, curriculum,
 
 Cel: polityka działająca na głębi oszacowanej z obrazu RGB.
 
+Szczegółowy plan: `plan/M3.md`.
+
 Zakres 3a, percepcja (ML):
 - ewaluacja zero-shot Depth Anything V2 Small (wariant metryczny indoor) na zbiorach RGB-D: NYU Depth v2, opcjonalnie Hypersim lub TartanAir; metryki AbsRel i δ < 1,25 oraz opóźnienie,
 - dostrajanie na wybranym zbiorze, porównanie przed i po,
@@ -298,6 +300,8 @@ Czego się uczysz: transfer learning, metryki głębi, imitation learning, DAgge
 ### M4: ROS 2 + PX4 SITL + Gazebo, sim2sim (3-4 tyg.)
 
 Cel: pełny łańcuch jak na dronie, uruchomiony w innym symulatorze niż treningowy. Polityka, która nie przechodzi z jednego symulatora do drugiego, nie przejdzie też do rzeczywistości.
+
+Szczegółowy plan: `plan/M4.md`.
 
 Zakres:
 - kontener Docker: Ubuntu 24.04, ROS 2 Jazzy, Gazebo Harmonic, aktualne stabilne PX4, Micro XRCE-DDS Agent,

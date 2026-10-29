@@ -1,0 +1,22 @@
+# M4.12 fine-tuning of the asym students of M3.11 after the sim2sim diagnosis: the Gazebo depth
+# noise profile in the mix and the odometry error of EKF2 in SITL (DRIFT). Starts at the last
+# curriculum level from the student of the same seed: --set init=<run>/checkpoints/best.pt
+exp: m4/asym_ft
+variant: asym_ft
+total_steps: 40000000
+num_envs: 2048
+num_steps: 32
+update_epochs: 5
+num_minibatches: 4
+learning_rate: 1.0e-4
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+ent_coef: 0.005
+vf_coef: 0.5
+max_grad_norm: 1.0
+level: 5
+curriculum: true
+mix: 0.2
+randomize: true
+eval_every: 2000000

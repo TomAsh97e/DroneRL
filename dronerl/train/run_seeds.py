@@ -7,8 +7,11 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 MODULES = {
+    "dagger": "dronerl.train.dagger",
+    "depth_ft": "dronerl.perception.finetune",
     "dqn": "dronerl.agents.dqn",
     "ppo": "dronerl.agents.ppo",
+    "ppo_asym": "dronerl.agents.ppo_asym",
     "ppo_gpu": "dronerl.agents.ppo_gpu",
     "rsl_rl": "dronerl.train.rsl_rl_baseline",
     "sb3": "dronerl.train.sb3_baseline",

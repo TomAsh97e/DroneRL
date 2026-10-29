@@ -1,7 +1,9 @@
 """Vectorized navigation environment in PyTorch (M2.3).
 
 Velocity-level dynamics at constant height, depth and a virtual lidar by ray casting, the reward
-of the contract and a curriculum over the obstacle density of the map levels.
+of the contract and a curriculum over the obstacle density of the map levels. With `student`
+(M3.8) it also renders what the student will get on the drone: a tilted, noisy and delayed depth
+image and a noisy state with odometry drift.
 """
 
 import math
@@ -12,6 +14,7 @@ import torch
 from dronerl import contract
 from dronerl.envs import maps as mapgen
 from dronerl.envs import raycast
+from dronerl.envs.depth_noise import DepthNoise
 
 SUBSTEPS = 5
 SUB_DT = contract.DT / SUBSTEPS
@@ -20,7 +23,7 @@ RANGES = {
     "tau_v": (0.15, 0.6),
     "tau_yaw": (0.05, 0.3),
     "accel": (1.5, 4.0),
-    "delay": (0.0, 0.12),
+    "delay": (0.0, 0.3),  # PX4 in SITL answers a velocity step 0.20-0.26 s late (M4.9)
     "height": (1.0, 1.5),
 }
 MAX_DELAY = round(RANGES["delay"][1] / SUB_DT)  # in substeps
@@ -28,6 +31,32 @@ PROMOTE_SR = 0.8
 PROMOTE_WINDOW = 1000
 CHUNK = 4096  # envs per ray casting batch, bounds the memory of the [E, R, B] intermediates
 OBSTACLES = ("circles", "circle_mask", "boxes", "box_mask")
+
+# sensors of the student; evaluation conditions also fix the dynamics: randomized in the test
+# ones, nominal in `clean`. The Gazebo profile takes half of the mono share, the error of the model
+# in a new domain is not the one of NYU (M4.12); the active share keeps a depth camera an option
+STUDENT = {
+    "mix": {"mono": 0.35, "gazebo": 0.35, "active": 0.3},
+    "state_noise": True,
+    "tilt": True,
+    "latency": True,
+}
+CONDITIONS = {
+    "test": {**STUDENT, "mix": {"mono": 1.0}},
+    "test_active": {**STUDENT, "mix": {"active": 1.0}},
+    "clean": {"mix": {"none": 1.0}, "state_noise": False, "tilt": False, "latency": False},
+}
+G = 9.81
+TILT_TAU = (0.05, 0.15)  # lag of the attitude behind the acceleration [s]
+MOUNT = (math.radians(5), math.radians(2))  # camera mount error, pitch and roll
+VIBRATION = math.radians(0.5)
+# white noise std and bias range of v_fwd, v_lat, yaw_rate and height, roughly the PX4 EKF with
+# optical flow and a rangefinder
+STATE_NOISE = (0.05, 0.05, 0.02, 0.03)
+STATE_BIAS = (0.05, 0.05, 0.01, 0.05)
+# odometry position error per metre of path; EKF2 with flow and a magnetometer in SITL turns its
+# frame by 6-7°, about 10% of the path (M4.11)
+DRIFT = (0.01, 0.1)
 
 
 def load_maps(split, levels=None):
@@ -38,7 +67,8 @@ def load_maps(split, levels=None):
 class NavEnv:
     """A batch of navigation episodes stepped together.
 
-    Observations are dicts of tensors: depth [E, 1, 48, 64], state [E, 10], lidar [E, 72].
+    Observations are dicts of tensors: depth [E, 1, 48, 64], state [E, 10], lidar [E, 72], and with
+    `student` (a dict like CONDITIONS) also student_depth [E, 2, 48, 64] and student_state [E, 10].
     With autoreset (training) finished episodes restart within the same step, and
     info["final_obs"] holds the last observation of the truncated ones (rows info["final_idx"]).
     Without it (evaluation) env i plays map i once and then stays frozen.
@@ -56,6 +86,7 @@ class NavEnv:
         randomize=False,
         prox_w=contract.PROXIMITY_W,
         autoreset=True,
+        student=None,
     ):
         dev = self.device = torch.device(device)
         self.num_envs = E = len(maps["start"]) if num_envs is None else num_envs
@@ -103,8 +134,26 @@ class NavEnv:
         self.hist = torch.zeros(E, MAX_DELAY // SUBSTEPS + 1, 3, device=dev)
         self.alive = torch.ones(E, dtype=torch.bool, device=dev)
 
+        self.student = student
+        if student:
+            self.noise = DepthNoise(E, self.gen, student["mix"])
+            self.ray_angles = torch.cat([raycast.FAN_ANGLES, raycast.LIDAR_ANGLES]).to(dev)
+            for name in ("tilt", "mount", "odometry"):  # (pitch, roll) and (x, y)
+                setattr(self, name, torch.zeros(E, 2, device=dev))
+            for name in ("alpha_tilt", "drift", "drift_angle"):
+                setattr(self, name, torch.zeros(E, device=dev))
+            self.state_bias = torch.zeros(E, 4, device=dev)
+            self.state_noise = torch.tensor(STATE_NOISE, device=dev)
+            self.lag = torch.zeros(E, dtype=torch.bool, device=dev)
+            self.fresh = torch.ones(E, dtype=torch.bool, device=dev)
+            shape = (E, contract.STUDENT_CHANNELS, contract.IMG_H, contract.IMG_W)
+            self.last_image = torch.zeros(shape, device=dev)
+
     def rand(self, n):
         return torch.rand(n, generator=self.gen, device=self.device)
+
+    def randn(self, n):
+        return torch.randn(n, generator=self.gen, device=self.device)
 
     def obstacles(self, rows=None):
         rows = slice(None) if rows is None else rows
@@ -152,21 +201,69 @@ class NavEnv:
         self.alpha_yaw[ids] = 1 - torch.exp(-SUB_DT / p["tau_yaw"])
         self.accel[ids], self.height[ids] = p["accel"], p["height"]
         self.delay[ids] = (p["delay"] / SUB_DT).round().long()
+        if self.student:
+            self.reset_student(ids)
+
+    def reset_student(self, ids):
+        n, s = len(ids), self.student
+        self.noise.reset(ids)
+        self.tilt[ids] = 0
+        tau = TILT_TAU[0] + (TILT_TAU[1] - TILT_TAU[0]) * self.rand(n)
+        self.alpha_tilt[ids] = 1 - torch.exp(-SUB_DT / tau)
+        mount = torch.tensor(MOUNT, device=self.device)
+        self.mount[ids] = (2 * self.rand((n, 2)) - 1) * mount * s["tilt"]
+        self.lag[ids] = (self.rand(n) < 0.5) & s["latency"]
+        self.fresh[ids] = True
+        self.odometry[ids] = 0
+        self.drift[ids] = (DRIFT[0] + (DRIFT[1] - DRIFT[0]) * self.rand(n)) * s["state_noise"]
+        self.drift_angle[ids] = (2 * self.rand(n) - 1) * math.pi
+        bias = torch.tensor(STATE_BIAS, device=self.device)
+        self.state_bias[ids] = (2 * self.rand((n, 4)) - 1) * bias * s["state_noise"]
 
     def observe(self, ids=None):
         rows = self.rows if ids is None else ids
         out = {"depth": [], "state": [], "lidar": []}
+        if self.student:
+            out.update(student_depth=[], student_state=[])
         for chunk in rows.split(CHUNK):
             pos, yaw, height = self.pos[chunk], self.yaw[chunk], self.height[chunk]
             hits = raycast.cast(pos, yaw[:, None] + self.ray_angles, self.obstacles(chunk))
-            columns, beams = hits[:, : contract.IMG_W], hits[:, contract.IMG_W :]
+            rays, beams = hits[:, : -contract.LIDAR_BEAMS], hits[:, -contract.LIDAR_BEAMS :]
+            # the fan of the student contains the image columns of the level teacher camera
+            columns = rays[:, raycast.FAN_COLUMNS] if self.student else rays
             depth = raycast.depth_image(columns, height, self.env["obstacle_height"][chunk])
             out["depth"].append(contract.encode_depth(depth)[:, None])
             out["lidar"].append(contract.encode_depth(beams))
             goal = self.env["goal"][chunk] - pos
             vel, rate, prev = self.vel[chunk], self.yaw_rate[chunk], self.prev_action[chunk]
             out["state"].append(contract.state_vector(vel, yaw, rate, height, goal, prev))
+            if self.student:
+                out["student_depth"].append(self.student_image(chunk, rays, depth))
+                out["student_state"].append(self.student_state(chunk))
         return {k: torch.cat(v) for k, v in out.items()}
+
+    def student_image(self, rows, fan, level):
+        if self.student["tilt"]:
+            vibration = VIBRATION * self.randn((len(rows), 2))
+            pitch, roll = (self.tilt[rows] + self.mount[rows] + vibration).unbind(-1)
+            obstacle_height = self.env["obstacle_height"][rows]
+            level = raycast.tilted_depth(fan, self.height[rows], obstacle_height, pitch, roll)
+        image = contract.encode_student_depth(self.noise(level, rows))
+        # a delayed camera shows the frame of the previous step, a new episode has none yet
+        old = (self.lag[rows] & ~self.fresh[rows])[:, None, None, None]
+        out = torch.where(old, self.last_image[rows], image)
+        self.last_image[rows], self.fresh[rows] = image, False
+        return out
+
+    def student_state(self, rows):
+        goal = self.env["goal"][rows] - self.pos[rows] - self.odometry[rows]
+        vel, yaw, rate = self.vel[rows], self.yaw[rows], self.yaw_rate[rows]
+        height, prev = self.height[rows], self.prev_action[rows]
+        state = contract.state_vector(vel, yaw, rate, height, goal, prev)
+        if not self.student["state_noise"]:
+            return state
+        noise = self.state_bias[rows] + self.state_noise * self.randn((len(rows), 4))
+        return torch.cat([state[:, :4] + noise, state[:, 4:]], 1)
 
     def step(self, action):
         a = action.clamp(-1, 1)
@@ -189,6 +286,8 @@ class NavEnv:
             dv = (self.target - self.vel) * self.alpha_v[:, None]
             limit = self.accel[:, None] * SUB_DT / dv.norm(dim=-1, keepdim=True).clamp(min=1e-9)
             vel = self.vel + dv * limit.clamp(max=1)
+            if self.student:
+                self.move_student(vel, moving)
             self.vel = torch.where(moving[:, None], vel, self.vel)
             self.pos = torch.where(moving[:, None], self.pos + vel * SUB_DT, self.pos)
             self.path_len += moving * vel.norm(dim=-1) * SUB_DT
@@ -244,6 +343,17 @@ class NavEnv:
             for key, value in self.observe(ids).items():
                 obs[key][ids] = value
         return obs, reward, terminated, truncated, info
+
+    def move_student(self, vel, moving):
+        """Attitude from the acceleration of this substep and the odometry error of its motion."""
+        if self.student["tilt"]:
+            a_fwd, a_lat = contract.to_heading(*((vel - self.vel) / SUB_DT).unbind(-1), self.yaw)
+            # forward acceleration pitches the nose down, to the left lowers the left side
+            target = torch.stack([torch.atan(a_fwd / G), -torch.atan(a_lat / G)], -1)
+            self.tilt += (target - self.tilt) * (self.alpha_tilt * moving)[:, None]
+        c, s = self.drift_angle.cos(), self.drift_angle.sin()
+        dx, dy = (vel * SUB_DT * moving[:, None]).unbind(-1)
+        self.odometry += self.drift[:, None] * torch.stack([c * dx - s * dy, s * dx + c * dy], -1)
 
     def track(self, levels, success):
         """Curriculum: promotion after PROMOTE_SR over the last episodes on the current level."""

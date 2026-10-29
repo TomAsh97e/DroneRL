@@ -1,0 +1,6 @@
+# The build needs only these files; PX4 sources are mounted at run time
+*
+!docker/entrypoint.sh
+!external/px4_msgs
+!external/Micro-XRCE-DDS-Agent
+!external/PX4-Autopilot/Tools/setup/requirements.txt

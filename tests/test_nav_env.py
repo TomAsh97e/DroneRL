@@ -3,11 +3,22 @@ import math
 import numpy as np
 import pytest
 import torch
+from scipy.spatial.transform import Rotation
 
 from dronerl import contract
 from dronerl.envs import maps as mapgen
 from dronerl.envs import raycast
-from dronerl.envs.nav_gpu import NOMINAL, SUB_DT, SUBSTEPS, NavEnv
+from dronerl.envs.depth_noise import edge_distance
+from dronerl.envs.nav_gpu import (
+    CONDITIONS,
+    NOMINAL,
+    STATE_BIAS,
+    STATE_NOISE,
+    STUDENT,
+    SUB_DT,
+    SUBSTEPS,
+    NavEnv,
+)
 
 
 def scene(circles=(), boxes=(), start=(2, 5), goal=(18, 5), yaw0=0.0, size=(20, 10), walls=True):
@@ -39,15 +50,18 @@ def fly(env, action, steps):
     return out
 
 
-def reference_depth(m, pos, yaw, height):
-    """Per-pixel sphere tracing of the extruded map in numpy, independent of the column method."""
+def reference_depth(m, pos, yaw, height, pitch=0.0, roll=0.0):
+    """Per-pixel sphere tracing of the extruded map in numpy, independent of the column method.
+
+    Metric depth along the optical axis of a camera rotated by R_z(yaw) R_y(pitch) R_x(roll).
+    """
     v, u = np.meshgrid(
         np.arange(contract.IMG_H) + 0.5, np.arange(contract.IMG_W) + 0.5, indexing="ij"
     )
     left = (contract.IMG_W / 2 - u) / contract.FOCAL
     up = (contract.IMG_H / 2 - v) / contract.FOCAL
-    fwd, side = np.array([math.cos(yaw), math.sin(yaw)]), np.array([-math.sin(yaw), math.cos(yaw)])
-    d = np.concatenate([fwd + left.reshape(-1, 1) * side, up.reshape(-1, 1)], 1)
+    cam = np.stack([np.ones_like(left), left, up], -1).reshape(-1, 3)
+    d = cam @ Rotation.from_euler("ZYX", [yaw, pitch, roll]).as_matrix().T
     norm = np.linalg.norm(d, axis=1)
     d /= norm[:, None]
     origin = np.array([*pos, height])
@@ -62,7 +76,21 @@ def reference_depth(m, pos, yaw, height):
             break
         t = np.where(active, t + s, t)
     depth = np.where(t < 30, t / norm, np.inf)  # forward component of the unit ray is 1/norm
-    return contract.encode_depth(torch.tensor(depth.reshape(contract.IMG_H, contract.IMG_W)))
+    return torch.tensor(depth.reshape(contract.IMG_H, contract.IMG_W))
+
+
+def random_view(seed):
+    """A map of the densest level and a pose on its A* path, closer to obstacles than the start."""
+    pool = mapgen.load("val", 5)
+    rng = np.random.default_rng(seed)
+    m = mapgen.get_map(pool, int(rng.integers(len(pool["start"]))))
+    k = int(rng.integers(len(m["path"]) - 1))
+    pos = m["path"][k] + rng.uniform(0.2, 0.8) * (m["path"][k + 1] - m["path"][k])
+    return m, pos, rng.uniform(-math.pi, math.pi), rng
+
+
+def fan_of(env):
+    return raycast.cast(env.pos, env.yaw[:, None] + raycast.FAN_ANGLES, env.obstacles())
 
 
 def test_depth_of_a_cylinder_ahead():
@@ -98,18 +126,49 @@ def test_rotated_box_and_lidar():
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_column_depth_matches_per_pixel_reference(seed):
-    pool = mapgen.load("val", 5)
-    rng = np.random.default_rng(seed)
-    i = int(rng.integers(len(pool["start"])))
-    m = mapgen.get_map(pool, i)
-    # a point along the A* path, closer to obstacles than the start
-    k = int(rng.integers(len(m["path"]) - 1))
-    pos = m["path"][k] + rng.uniform(0.2, 0.8) * (m["path"][k + 1] - m["path"][k])
-    yaw = rng.uniform(-math.pi, math.pi)
+    m, pos, yaw, _ = random_view(seed)
     env = env_for(dict(m, start=pos, yaw0=yaw))
     depth = env.reset()["depth"][0, 0].double()
-    expected = reference_depth(m, pos, yaw, NOMINAL["height"])
+    expected = contract.encode_depth(reference_depth(m, pos, yaw, NOMINAL["height"]))
     torch.testing.assert_close(depth, expected, atol=1e-4, rtol=0)
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_level_tilted_camera_matches_columns(seed):
+    m, pos, yaw, _ = random_view(seed)
+    env = env_for(dict(m, start=pos, yaw0=yaw))
+    env.reset()
+    fan, obstacle_height, zero = fan_of(env), env.env["obstacle_height"], torch.zeros(1)
+    columns = raycast.depth_image(fan[:, raycast.FAN_COLUMNS], env.height, obstacle_height)
+    tilted = raycast.tilted_depth(fan, env.height, obstacle_height, zero, zero)
+    torch.testing.assert_close(tilted, columns, rtol=1e-5, atol=0)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2, 3])
+def test_tilted_camera_matches_3d_reference(seed):
+    m, pos, yaw, rng = random_view(seed)
+    pitch, roll = np.radians(rng.uniform(-20, 20, 2))
+    env = env_for(dict(m, start=pos, yaw0=yaw))
+    env.reset()
+    angles = torch.tensor([pitch, roll], dtype=torch.float32)[:, None]
+    depth = raycast.tilted_depth(fan_of(env), env.height, env.env["obstacle_height"], *angles)
+    expected = reference_depth(m, pos, yaw, NOMINAL["height"], pitch, roll).clamp(max=8)
+    error = (depth[0].double().clamp(max=8) - expected).abs() / expected
+    # azimuth is discretised, so only pixels at least 1 px from a depth step must be exact
+    away = edge_distance(expected[None], 1)[0] >= 1
+    assert (error[away] < 0.01).double().mean() >= 0.98
+    assert (error < 0.01).double().mean() >= 0.9
+
+
+def test_pitch_down_moves_the_horizon_up():
+    fan = torch.full((3, len(raycast.FAN_U)), math.inf)
+    pitch = torch.tensor([0.0, math.radians(10), 0.0])
+    roll = torch.tensor([0.0, 0.0, math.radians(10)])
+    depth = raycast.tilted_depth(fan, torch.full((3,), 1.2), torch.full((3,), 3.0), pitch, roll)
+    horizon = depth.isfinite().double().argmax(1)  # first floor row in each column
+    assert (horizon[1] < horizon[0]).all()
+    # right side down: the right part of the image looks lower, so the horizon rises there
+    assert horizon[2, -1] < horizon[2, 0]
 
 
 def test_rays_and_distances_match_numpy():
@@ -234,6 +293,78 @@ def test_curriculum_promotion_and_level_mix():
     assert share[4:].sum() == 0
 
 
+def test_clean_student_sees_what_the_teacher_sees():
+    scenes = scene(circles=[(5, 5, 0.5)]), scene(boxes=[(6, 4, 1, 0.3, 0.5)])
+    env = env_for(*scenes, student=CONDITIONS["clean"])
+    obs = env.reset()
+    assert obs["student_depth"].shape == (2, 2, 48, 64) and obs["student_state"].shape == (2, 10)
+    for _ in range(5):
+        torch.testing.assert_close(obs["student_depth"][:, 0], obs["depth"][:, 0], atol=0, rtol=0)
+        assert (obs["student_depth"][:, 1] == 1).all()
+        torch.testing.assert_close(obs["student_state"], obs["state"], atol=0, rtol=0)
+        obs = env.step(torch.tensor([[1.0, 0.3, 0.2]]).expand(2, 3))[0]
+
+
+def test_delayed_image_is_the_previous_frame():
+    env = env_for(scene(circles=[(5, 5, 0.5)]), student={**CONDITIONS["clean"], "latency": True})
+    obs = env.reset()
+    env.lag[:] = True
+    for _ in range(4):
+        new = env.step(torch.tensor([[1.0, 0.0, 0.0]]))[0]
+        assert not torch.equal(new["depth"], obs["depth"])
+        torch.testing.assert_close(new["student_depth"][:, :1], obs["depth"], atol=0, rtol=0)
+        obs = new
+
+
+def test_student_determinism():
+    pool = mapgen.load("val", 4)
+    actions = torch.rand(10, 8, 3, generator=torch.Generator().manual_seed(0)) * 2 - 1
+    runs = []
+    for _ in range(2):
+        env = NavEnv(pool, num_envs=8, device="cpu", seed=3, level=4, mix=0.0, student=STUDENT)
+        obs = [env.reset()] + [env.step(a)[0] for a in actions]
+        runs.append([(o["student_depth"], o["student_state"]) for o in obs])
+    torch.testing.assert_close(runs[0], runs[1], atol=0, rtol=0)
+
+
+def test_state_noise_statistics():
+    env = env_for(*[scene(walls=False)] * 400, student=CONDITIONS["test"])
+    obs = env.reset()
+    errors = []
+    for _ in range(20):  # hovering, the true state stays put
+        errors.append(obs["student_state"][:, :4] - obs["state"][:, :4])
+        obs = env.step(torch.zeros(400, 3))[0]
+    errors = torch.stack(errors)
+    noise, bias = torch.tensor(STATE_NOISE), torch.tensor(STATE_BIAS)
+    torch.testing.assert_close(errors.std(0).mean(0), noise, rtol=0.1, atol=0)
+    # constant bias per episode, uniform in ±STATE_BIAS, plus what is left of the noise
+    expected = (bias**2 / 3 + noise**2 / len(errors)).sqrt()
+    torch.testing.assert_close(errors.mean(0).std(0), expected, rtol=0.15, atol=0)
+
+
+def test_odometry_drift():
+    env = env_for(scene(), scene(), student=CONDITIONS["test"])
+    env.reset()
+    env.drift[:] = torch.tensor([0.0, 0.02])
+    obs = fly(env, [1.0, 0.0, 0.0], 30)[0]
+    assert env.odometry[0].norm() == 0
+    torch.testing.assert_close(obs["student_state"][0, 4:], obs["state"][0, 4:], atol=0, rtol=0)
+    # in a straight line the error grows by the drift coefficient per metre
+    assert env.odometry[1].norm().item() == pytest.approx(0.02 * env.path_len[1].item(), rel=1e-3)
+
+
+def test_tilt_follows_the_acceleration():
+    env = env_for(scene(), student={**CONDITIONS["clean"], "tilt": True})
+    env.reset()
+    env.mount[:] = 0
+    fly(env, [1.0, 0.0, 0.0], 2)
+    assert env.tilt[0, 0] > math.radians(5)  # accelerating forward pitches the nose down
+    fly(env, [1.0, 0.0, 0.0], 30)
+    assert env.tilt[0].abs().max() < math.radians(0.5)  # constant speed is level
+    fly(env, [1.0, 1.0, 0.0], 2)
+    assert env.tilt[0, 1] < -math.radians(3)  # to the left: the left side goes down
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 def test_cuda_smoke():
     env = NavEnv(mapgen.load("val", 5), num_envs=64, device="cuda", level=5, mix=0)
@@ -241,4 +372,9 @@ def test_cuda_smoke():
     for _ in range(10):
         obs, reward, *_ = env.step(torch.rand(64, 3, device="cuda") * 2 - 1)
     assert obs["depth"].is_cuda and torch.isfinite(reward).all()
+    assert all(torch.isfinite(v).all() for v in obs.values())
+    env = NavEnv(mapgen.load("val", 5), num_envs=64, device="cuda", level=5, mix=0, student=STUDENT)
+    obs = env.reset()
+    for _ in range(10):
+        obs, reward, *_ = env.step(torch.rand(64, 3, device="cuda") * 2 - 1)
     assert all(torch.isfinite(v).all() for v in obs.values())

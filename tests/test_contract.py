@@ -30,6 +30,17 @@ def test_depth_encoding():
     torch.testing.assert_close(c.decode_depth(v[1:4]), d[1:4])
 
 
+def test_student_depth_encoding():
+    d = torch.tensor([[0.1, 1.0, 20.0, math.inf, math.nan]])
+    img = c.encode_student_depth(d)
+    assert img.shape == (c.STUDENT_CHANNELS, 1, 5)
+    torch.testing.assert_close(img[0], c.encode_depth(d.nan_to_num(math.inf)))
+    # far is a valid reading, missing data is 0 in both channels
+    assert img[1].tolist() == [[1, 1, 1, 1, 0]] and img[0, 0, 4] == 0
+    batch = c.encode_student_depth(torch.ones(4, c.IMG_H, c.IMG_W))
+    assert batch.shape == (4, c.STUDENT_CHANNELS, c.IMG_H, c.IMG_W)
+
+
 def test_camera_intrinsics():
     assert c.FOCAL == pytest.approx(32)
     assert math.degrees(2 * math.atan(c.IMG_H / 2 / c.FOCAL)) == pytest.approx(73.74, abs=0.01)

@@ -18,3 +18,12 @@ runs/
 .vscode/
 cmake-build-*/
 .DS_Store
+
+# Third-party sources for the simulation stack (PX4, px4_msgs, Micro XRCE-DDS Agent), see plan/M4.md
+external/
+# CC0 textures of the Gazebo worlds, downloaded by sim/gazebo/fetch_textures.sh
+sim/gazebo/media/
+# colcon output of the ROS 2 workspace
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/

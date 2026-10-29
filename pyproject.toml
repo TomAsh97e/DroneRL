@@ -9,15 +9,19 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "gym-pybullet-drones",
     "gymnasium[box2d,classic-control]>=1.4.0",
+    "h5py>=3.16.0",
     "imageio[ffmpeg]>=2.38.1",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
+    "onnxruntime>=1.31.1",
     "optuna==5.0.0",
     "pyyaml>=6.0.3",
     "rsl-rl-lib==5.5.1",
+    "scipy>=1.18.1",
     "stable-baselines3>=2.9.0",
     "tensorboard>=2.21.0",
     "torch>=2.14.1",
+    "transformers>=5.21.0",
 ]
 
 [build-system]

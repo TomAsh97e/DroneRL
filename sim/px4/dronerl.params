@@ -1,0 +1,34 @@
+# PX4 parameters of the DroneRL drone on top of the x500 airframe. sim/sitl.sh loads them in SITL,
+# in M5 the same set goes to the drone. Indoor hall (plan/M4.md, D2): optical flow and a downward
+# ToF rangefinder, no GPS.
+SYS_HAS_GPS 0
+EKF2_GPS_CTRL 0
+EKF2_OF_CTRL 1
+# flat hall floor: the rangefinder holds the height better than the barometer indoors
+EKF2_RNG_CTRL 2
+EKF2_HGT_REF 2
+# the SITL barometer drifts by decimetres and dragged the height away from the rangefinder (M4.7)
+EKF2_BARO_CTRL 0
+# no external vision on the drone, ground truth must not reach the EKF
+EKF2_EV_CTRL 0
+# sensor positions in the body frame (FRD) as in sim/gazebo/models/x500_dronerl
+EKF2_OF_POS_X 0.03
+EKF2_OF_POS_Z 0.1
+EKF2_RNG_POS_Z 0.05
+# the companion talks to PX4 over DDS, not MAVLink, so no ground station link is expected
+NAV_DLL_ACT 0
+# flight height of the contract
+MIS_TAKEOFF_ALT 1.2
+# offboard loss: Position mode, so a pilot with RC holds the drone (M5); without RC the action of RC
+# loss applies, Land, as Return would climb to RTL_RETURN_ALT once the EKF has a global origin
+COM_OF_LOSS_T 1.0
+COM_OBL_RC_ACT 0
+NAV_RCL_ACT 3
+# hard geofence behind the soft one of safety_node: landing at a breach of the cylinder around home
+# (GF_MAX_HOR_DIST from the map, sim.launch.py) or of the ceiling; it needs the global origin that
+# mission_node gives the EKF
+GF_ACTION 5
+GF_MAX_VER_DIST 2.5
+# Return, still left to some failsafes, stays at the flight height indoors
+RTL_RETURN_ALT 1.2
+RTL_DESCEND_ALT 1.2

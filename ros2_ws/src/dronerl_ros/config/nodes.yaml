@@ -1,0 +1,27 @@
+# Parameters of the flight nodes; world, pair, models, source and out come from sim.launch.py
+depth_node:
+  ros__parameters:
+    device: cuda
+    rate: 10.0  # control rate of the contract, policy_node acts on each image
+policy_node:
+  ros__parameters:
+    max_age: 0.5  # s, an older student image gives no command
+safety_node:
+  ros__parameters:
+    fence: true
+    margin: 1.1  # m, see dronerl.runtime.safety.FENCE_MARGIN
+    rate: 20.0
+px4_bridge:
+  ros__parameters:
+    rate: 20.0  # OffboardControlMode and TrajectorySetpoint every 50 ms
+    timeout: 0.5  # s without input -> no stream, PX4 offboard loss failsafe
+    lead: 0.26  # s, PX4 answers a velocity setpoint this late in SITL (M4.9)
+mission_node:
+  ros__parameters:
+    height: 1.2  # m above the floor, NOMINAL of NavEnv
+    hover: 2.0  # s before the policy takes over
+    policy_timeout: 1.0  # s without a policy command -> landing
+monitor_node:
+  ros__parameters:
+    jpeg_rate: 10.0
+    jpeg_quality: 80

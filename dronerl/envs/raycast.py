@@ -20,6 +20,14 @@ COLUMN_ANGLES = torch.atan((contract.IMG_W / 2 - U) / contract.FOCAL)  # left is
 ROW_SLOPES = (contract.IMG_H / 2 - V) / contract.FOCAL  # up is positive
 LIDAR_ANGLES = torch.arange(contract.LIDAR_BEAMS) * 2 * math.pi / contract.LIDAR_BEAMS
 
+# horizontal fan of the tilted student camera: image columns every FAN_STEP px, extended by 24 px
+# (±60°) for pitch and roll; the column rays are part of it, so a level camera hits them exactly
+FAN_STEP = 0.5
+FAN_U = torch.arange(-24, contract.IMG_W + 24 - 1 + FAN_STEP / 2, FAN_STEP) + 0.5
+FAN_ANGLES = torch.atan((contract.IMG_W / 2 - FAN_U) / contract.FOCAL)
+FAN_COLUMNS = ((U - FAN_U[0]) / FAN_STEP).round().long()
+SAME_SURFACE = 0.1  # relative difference of neighbouring fan rays still on one surface
+
 
 def boxes_from_maps(boxes):
     """(x, y, hx, hy, angle) -> (x, y, cos, sin, hx, hy)."""
@@ -90,4 +98,37 @@ def depth_image(columns, camera_height, obstacle_height):
     below_top = camera_height[:, None, None] + z_obs * slopes <= obstacle_height[:, None, None]
     z_obs = torch.where(below_top, z_obs, INF)
     z_floor = torch.where(slopes < 0, camera_height[:, None, None] / -slopes, INF)  # [E, H, 1]
+    return torch.minimum(z_obs, z_floor)
+
+
+def tilted_depth(fan, camera_height, obstacle_height, pitch, roll):
+    """Metric depth [E, H, W] along the optical axis of a camera with pitch [E] (down is positive)
+    and roll [E] (right side down is positive) in the heading frame.
+
+    fan [E, R] are the horizontal distances along FAN_ANGLES. A pixel interpolates between the two
+    rays around its azimuth when they see the same surface and takes the nearer one in azimuth
+    otherwise, so oblique walls stay exact and edges stay sharp. The prism argument of depth_image
+    holds for any ray direction, so only the azimuth is discretised.
+    """
+    dev = fan.device
+    left = ((contract.IMG_W / 2 - U.to(dev)) / contract.FOCAL)[None, None, :]
+    up = ROW_SLOPES.to(dev)[None, :, None]
+    cp, sp = pitch.cos()[:, None, None], pitch.sin()[:, None, None]
+    cr, sr = roll.cos()[:, None, None], roll.sin()[:, None, None]
+    # pixel ray (1, left, up) of the camera rotated by R_y(pitch) R_x(roll), FLU
+    y, z = left * cr - up * sr, left * sr + up * cr
+    x, z = (cp + z * sp).clamp(min=1e-6), z * cp - sp
+    h = torch.hypot(x, y)
+    u = contract.IMG_W / 2 - contract.FOCAL * y / x
+    pos = ((u - FAN_U[0].item()) / FAN_STEP).clamp(0, len(FAN_U) - 1)
+    k = pos.floor().long().clamp(max=len(FAN_U) - 2)
+    w = pos - k
+    r0 = fan.gather(1, k.flatten(1)).view_as(k)
+    r1 = fan.gather(1, (k + 1).flatten(1)).view_as(k)
+    same = (r0 - r1).abs() <= SAME_SURFACE * torch.minimum(r0, r1)
+    r = torch.where(same, r0 + w * (r1 - r0), torch.where(w < 0.5, r0, r1))
+    # the forward component of the pixel ray is 1, so depth is distance along it over |ray|_xy
+    below_top = camera_height[:, None, None] + r * z / h <= obstacle_height[:, None, None]
+    z_obs = torch.where(below_top, r / h, INF)
+    z_floor = torch.where(z < 0, camera_height[:, None, None] / -z, INF)
     return torch.minimum(z_obs, z_floor)

@@ -193,7 +193,7 @@ def train(cfg: Config):
         done += n
         step = done * batch
         actor = runner.get_inference_policy()
-        returns, extra = eval_row(validate(actor, val))
+        returns, extra = eval_row(validate(lambda: actor, val))
         row = log.eval(step, returns, level=nav.level, **extra)
         if score(row) >= best:
             best, best_step = score(row), step
@@ -201,7 +201,8 @@ def train(cfg: Config):
 
     save(actor, ckpt / "last.pt", step)
     best_actor = load(ckpt / "best.pt", dev)
-    returns, extra = eval_row(validate(best_actor, eval_envs("test", cfg.eval_levels, dev)))
+    test = eval_envs("test", cfg.eval_levels, dev)
+    returns, extra = eval_row(validate(lambda: best_actor, test))
     log.final(best_step, returns, **extra)
     log.close()
     return run_dir

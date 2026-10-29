@@ -2,7 +2,9 @@
 
 A policy is `act(obs) -> action` on tensors. Specs: "astar[:lookahead[:k_yaw]]" for pure pursuit
 on the A* path, "straight[:k_p]" for flying straight at the goal, a run directory or checkpoint
-of a trained policy.
+of a trained policy (teacher or student). `condition` (M3) gives the envs the sensors of the
+student and the dynamics of nav_gpu.CONDITIONS, the same for every policy, so a teacher evaluated
+next to a student meets the same random conditions on its privileged observations.
 """
 
 import argparse
@@ -19,8 +21,9 @@ import yaml
 from dronerl import contract
 from dronerl.agents import ppo_gpu
 from dronerl.agents.scripted import GoalP, PurePursuit
+from dronerl.agents.student import Policy, Student
 from dronerl.envs import maps as mapgen
-from dronerl.envs.nav_gpu import NavEnv
+from dronerl.envs.nav_gpu import CONDITIONS, NavEnv
 from dronerl.eval import nav_plots
 from dronerl.train import rsl_rl_baseline
 
@@ -37,9 +40,13 @@ def checkpoint(spec):
 
 
 def load_trained(path, device):
-    """`act` of a checkpoint of ppo_gpu.py or rsl_rl_baseline.py."""
-    if "actor" in torch.load(path, map_location="cpu"):
+    """`act` of a checkpoint of ppo_gpu.py, rsl_rl_baseline.py or a student, which keeps its
+    history, so it is loaded anew for every batch of episodes."""
+    ckpt = torch.load(path, map_location="cpu")
+    if "actor" in ckpt:
         return rsl_rl_baseline.load(path, device)
+    if "student" in ckpt:
+        return Policy(Student.load(path, device))
     return ppo_gpu.Agent.load(path, device).act
 
 
@@ -48,8 +55,8 @@ def load_policy(spec, device):
     ckpt = checkpoint(spec)
     if ckpt is not None:
         cfg = yaml.safe_load((ckpt.parent.parent / "config.yaml").read_text())
-        act = load_trained(ckpt, device)
-        return cfg["variant"], f"{cfg['variant']} s{cfg['seed']}", lambda env, pool: act
+        name = f"{cfg['variant']} s{cfg['seed']}"
+        return cfg["variant"], name, lambda env, pool: load_trained(ckpt, device)
     kind, *args = spec.split(":")
     if kind == "astar":
         lookahead = float(args[0]) if args else 1.0
@@ -75,9 +82,11 @@ def rollout(env, act, frames=()):
     pos, yaw, actions, alive, depth = [snap(env.pos)], [snap(env.yaw)], [], [], []
     result = {k: torch.zeros(env.num_envs, dtype=torch.bool) for k in OUTCOMES}
     stats = {}
+    # with the student's sensors the strips and videos show what the student sees
+    image = "student_depth" if "student_depth" in obs else "depth"
     while env.alive.any():
         if len(frames):
-            depth.append(obs["depth"][list(frames), 0].cpu())
+            depth.append(obs[image][list(frames), 0].cpu())
         alive.append(snap(env.alive))
         a = act(obs).clamp(-1, 1)
         obs, _, terminated, truncated, info = env.step(a)
@@ -164,15 +173,19 @@ def evaluate(
     video=0,
     randomize=False,
     failures=False,
+    condition=None,
 ):
     """`video` is the number of maps recorded per level, `failures` plots all failed episodes."""
     device = torch.device(device)
     variant, name, make = load_policy(spec, device)
     ckpt = checkpoint(spec)
     result = {"variant": variant, "name": name, "spec": spec, "levels": {}}
+    if condition is not None:
+        result["condition"], randomize = condition, condition != "clean"
+    sensors = CONDITIONS.get(condition)
     for label, level in levels.items():
         pool = mapgen.load(split, level)
-        env = NavEnv(pool, device=device, autoreset=False, randomize=randomize)
+        env = NavEnv(pool, device=device, autoreset=False, randomize=randomize, student=sensors)
         run = rollout(env, make(env, pool), frames=range(max(int(video), int(plots))))
         m = metrics(run, pool)
         result["levels"][label] = m
@@ -270,6 +283,7 @@ def main(argv=None):
         "--video", type=int, nargs="?", const=1, default=0, metavar="N", help="videos of N maps"
     )
     parser.add_argument("--failures", action="store_true", help="plots of all failed episodes")
+    parser.add_argument("--condition", choices=CONDITIONS, help="sensors and dynamics of M3")
     args = parser.parse_args(argv)
     levels = {k: mapgen.TEST_LEVELS[k] for k in args.levels}
     args.out.mkdir(parents=True, exist_ok=True)
@@ -284,6 +298,7 @@ def main(argv=None):
             args.video,
             args.randomize,
             args.failures,
+            args.condition,
         )
         for spec in args.policies
     ]

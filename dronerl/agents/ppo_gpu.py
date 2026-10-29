@@ -15,12 +15,13 @@ from torch.distributions import Normal
 from dronerl import contract
 from dronerl.agents.ppo import RunningMeanStd, gae, layer
 from dronerl.envs import maps as mapgen
-from dronerl.envs.nav_gpu import NavEnv, load_maps
+from dronerl.envs.nav_gpu import CONDITIONS, NavEnv, load_maps
 from dronerl.eval.evaluate import score
 from dronerl.utils.logger import Logger
 from dronerl.utils.run import make_run_dir, parse_args, set_seed
 
 VEC_DIM = contract.STATE_DIM + contract.LIDAR_BEAMS
+EVAL_SEED = 0
 
 
 @dataclass
@@ -58,16 +59,21 @@ class Config:
     eval_every: int = 2_000_000
     # label -> map level of the validation and test envs
     eval_levels: dict = field(default_factory=lambda: dict(mapgen.TEST_LEVELS))
+    # M3: sensors of the student in training and a nav_gpu.CONDITIONS name for evaluation
+    sensors: dict | None = None
+    eval_condition: str | None = None
+    # M4.12: checkpoint whose agent the training starts from, to fine-tune it
+    init: str | None = None
 
 
 class Encoder(nn.Module):
-    """Depth image [N, 1, 48, 64] -> 128 features; stride 4 first, measured 2-4x faster in
+    """Depth image [N, C, 48, 64] -> 128 features; stride 4 first, measured 2-4x faster in
     training than a stride 2 start (plan/M2.md)."""
 
-    def __init__(self):
+    def __init__(self, channels=1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 16, 8, 4, padding=2),
+            nn.Conv2d(channels, 16, 8, 4, padding=2),
             nn.ELU(),
             nn.Conv2d(16, 32, 4, 2, padding=1),
             nn.ELU(),
@@ -116,17 +122,28 @@ class Agent(nn.Module):
         z = (x - self.vec_rms.mean) / torch.sqrt(self.vec_rms.var + 1e-8)
         return z.clamp(-10, 10).float()
 
-    def value(self, depth, vec):
-        return self.critic(depth, vec).squeeze(-1)
+    def inputs(self, obs, update=False, start=None):
+        """What the rollout buffer keeps of an observation; start marks new episodes."""
+        return {"depth": obs["depth"].half(), "vec": self.vec(obs, update)}
 
-    def dist(self, depth, vec):
-        mean = self.actor(depth, vec)
+    def value(self, x):
+        return self.critic(x["depth"].float(), x["vec"]).squeeze(-1)
+
+    def value_of(self, obs):
+        return self.critic(obs["depth"], self.vec(obs)).squeeze(-1)
+
+    def dist(self, x):
+        mean = self.actor(x["depth"].float(), x["vec"])
         return Normal(mean, self.log_std.exp().expand_as(mean))
 
     @torch.no_grad()
     def act(self, obs):
         """Deterministic action (mean of the distribution) for a raw observation."""
         return self.actor(obs["depth"], self.vec(obs))
+
+    def policy(self):
+        """act for one batch of evaluation episodes."""
+        return self.act
 
     def save(self, path, step):
         torch.save({"agent": self.state_dict(), "step": step, "version": contract.VERSION}, path)
@@ -140,10 +157,16 @@ class Agent(nn.Module):
 
 
 @torch.no_grad()
-def validate(act, envs):
-    """Success, collision rate and returns per level of evaluation envs (one episode per map)."""
+def validate(policy, envs):
+    """Success, collision rate and returns per level of evaluation envs (one episode per map).
+
+    policy() gives act for one batch of episodes, every validation meets the same random
+    conditions.
+    """
     result = {}
     for label, env in envs.items():
+        env.gen.manual_seed(EVAL_SEED)
+        act = policy()
         obs = env.reset()
         success, collision = torch.zeros_like(env.alive), torch.zeros_like(env.alive)
         returns = torch.zeros(env.num_envs, device=env.device)
@@ -160,9 +183,17 @@ def validate(act, envs):
     return result
 
 
-def eval_envs(split, levels, device):
+def eval_envs(split, levels, device, condition=None):
+    """Nominal envs, or with the sensors and dynamics of a nav_gpu.CONDITIONS name."""
+    randomize, sensors = condition not in (None, "clean"), CONDITIONS.get(condition)
     return {
-        label: NavEnv(mapgen.load(split, level), device=device, autoreset=False)
+        label: NavEnv(
+            mapgen.load(split, level),
+            device=device,
+            autoreset=False,
+            randomize=randomize,
+            student=sensors,
+        )
         for label, level in levels.items()
     }
 
@@ -182,8 +213,9 @@ def sync(device):
         torch.cuda.synchronize(device)
 
 
-def train(cfg: Config, on_eval=None):
-    """`on_eval(step, row)` runs after every validation, e.g. to report to Optuna."""
+def train(cfg: Config, on_eval=None, agent=None):
+    """`on_eval(step, row)` runs after every validation, e.g. to report to Optuna. `agent` replaces
+    the teacher's Agent, e.g. by one with an asymmetric critic (M3.11)."""
     set_seed(cfg.seed)
     dev = torch.device(cfg.device)
     torch.backends.cudnn.benchmark = True
@@ -200,9 +232,12 @@ def train(cfg: Config, on_eval=None):
         cfg.mix,
         cfg.randomize,
         cfg.prox_w,
+        student=cfg.sensors,
     )
-    val = eval_envs("val", cfg.eval_levels, dev)
-    agent = Agent(cfg.init_std).to(dev)
+    val = eval_envs("val", cfg.eval_levels, dev, cfg.eval_condition)
+    agent = (Agent(cfg.init_std) if agent is None else agent).to(dev)
+    if cfg.init:
+        agent.load_state_dict(torch.load(cfg.init, map_location=dev)["agent"])
     optimizer = torch.optim.Adam(agent.parameters(), lr=cfg.learning_rate, eps=1e-5)
     ret_rms = RunningMeanStd().to(dev)
 
@@ -210,8 +245,7 @@ def train(cfg: Config, on_eval=None):
     batch = T * N
     minibatch = batch // cfg.num_minibatches
     iterations = cfg.total_steps // batch
-    depth_buf = torch.zeros(T, N, 1, contract.IMG_H, contract.IMG_W, dtype=torch.half, device=dev)
-    vec_buf = torch.zeros(T, N, VEC_DIM, device=dev)
+    x_buf = None  # dict like agent.inputs(), allocated at the first step
     act_buf = torch.zeros(T, N, contract.ACT_DIM, device=dev)
     logp_buf, rew_buf, val_buf, term_buf, trunc_buf, final_buf = (
         torch.zeros(T, N, device=dev) for _ in range(6)
@@ -219,6 +253,7 @@ def train(cfg: Config, on_eval=None):
     levels = len(mapgen.DENSITY)
 
     obs = env.reset()
+    first = torch.ones(N, dtype=torch.bool, device=dev)
     disc_return = torch.zeros(N, device=dev)
     step, next_eval, best, best_step = 0, cfg.eval_every, (-np.inf,), 0
     start = time.time()
@@ -231,17 +266,21 @@ def train(cfg: Config, on_eval=None):
         stats = torch.zeros(5, levels, device=dev)
         t0 = time.time()
         for t in range(T):
-            vec = agent.vec(obs, update=True)
             with torch.no_grad():
-                dist = agent.dist(obs["depth"], vec)
+                x = agent.inputs(obs, update=True, start=first)
+                dist = agent.dist(x)
                 action = dist.sample()
                 logp_buf[t] = dist.log_prob(action).sum(-1)
-                val_buf[t] = agent.value(obs["depth"], vec)
-            depth_buf[t], vec_buf[t], act_buf[t] = obs["depth"], vec, action
+                val_buf[t] = agent.value(x)
+            if x_buf is None:
+                x_buf = {k: v.new_zeros(T, *v.shape) for k, v in x.items()}
+            for k, v in x.items():
+                x_buf[k][t] = v
+            act_buf[t] = action
             obs, reward, term, trunc, info = env.step(action)
             step += N
 
-            done = term | trunc
+            done = first = term | trunc
             lvl = info["level"]
             stats[0] += torch.bincount(lvl, done.float(), minlength=levels)
             for row, key in enumerate(["success", "collision", "timeout"], 1):
@@ -258,29 +297,28 @@ def train(cfg: Config, on_eval=None):
             only_trunc = trunc & ~term
             final_buf[t] = 0
             if "final_idx" in info and len(info["final_idx"]):
-                final = info["final_obs"]
                 with torch.no_grad():
-                    values = agent.value(final["depth"], agent.vec(final))
+                    values = agent.value_of(info["final_obs"])
                 final_buf[t, info["final_idx"]] = values
             rew_buf[t], term_buf[t], trunc_buf[t] = reward, term.float(), only_trunc.float()
 
         with torch.no_grad():
-            next_value = agent.value(obs["depth"], agent.vec(obs))
+            next_value = agent.value_of(obs)
         bufs = (rew_buf, val_buf, term_buf, trunc_buf, final_buf)
         adv, returns = gae(*bufs, next_value, cfg.gamma, cfg.gae_lambda, cfg.bootstrap_truncated)
         sync(dev)
         t1 = time.time()
 
-        b_depth = depth_buf.reshape(batch, 1, contract.IMG_H, contract.IMG_W)
-        b_vec, b_act = vec_buf.reshape(batch, VEC_DIM), act_buf.reshape(batch, contract.ACT_DIM)
+        b_x = {k: v.flatten(0, 1) for k, v in x_buf.items()}
+        b_act = act_buf.reshape(batch, contract.ACT_DIM)
         b_logp, b_adv, b_ret, b_val = (x.reshape(batch) for x in (logp_buf, adv, returns, val_buf))
         clipfracs = []
         for _ in range(cfg.update_epochs):
             perm = torch.randperm(batch, device=dev)
             for s in range(0, batch, minibatch):
                 idx = perm[s : s + minibatch]
-                depth = b_depth[idx].float()
-                dist = agent.dist(depth, b_vec[idx])
+                mb = {k: v[idx] for k, v in b_x.items()}
+                dist = agent.dist(mb)
                 logratio = dist.log_prob(b_act[idx]).sum(-1) - b_logp[idx]
                 ratio = logratio.exp()
                 entropy = dist.entropy().sum(-1).mean()
@@ -293,7 +331,7 @@ def train(cfg: Config, on_eval=None):
                 clipped_ratio = ratio.clamp(1 - cfg.clip_coef, 1 + cfg.clip_coef)
                 pg_loss = torch.max(-mb_adv * ratio, -mb_adv * clipped_ratio).mean()
 
-                value = agent.value(depth, b_vec[idx])
+                value = agent.value(mb)
                 v_loss = (value - b_ret[idx]) ** 2
                 if cfg.clip_vloss:
                     change = (value - b_val[idx]).clamp(-cfg.clip_coef, cfg.clip_coef)
@@ -340,7 +378,7 @@ def train(cfg: Config, on_eval=None):
         if step >= next_eval or it == iterations - 1:
             while next_eval <= step:
                 next_eval += cfg.eval_every
-            returns, extra = eval_row(validate(agent.act, val))
+            returns, extra = eval_row(validate(agent.policy, val))
             row = log.eval(step, returns, level=env.level, **extra)
             if on_eval is not None:
                 on_eval(step, row)
@@ -349,8 +387,9 @@ def train(cfg: Config, on_eval=None):
                 agent.save(ckpt / "best.pt", step)
 
     agent.save(ckpt / "last.pt", step)
-    best_agent = Agent.load(ckpt / "best.pt", dev)
-    returns, extra = eval_row(validate(best_agent.act, eval_envs("test", cfg.eval_levels, dev)))
+    best_agent = type(agent).load(ckpt / "best.pt", dev)
+    test = eval_envs("test", cfg.eval_levels, dev, cfg.eval_condition)
+    returns, extra = eval_row(validate(best_agent.policy, test))
     log.final(best_step, returns, **extra)
     log.close()
     return run_dir

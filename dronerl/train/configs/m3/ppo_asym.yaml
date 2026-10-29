@@ -1,0 +1,21 @@
+# M3.11 PPO with an asymmetric critic: hyperparameters and curriculum of M2.7, sensors of the main student
+exp: m3/asym
+variant: asym
+total_steps: 100000000
+num_envs: 2048
+num_steps: 32
+update_epochs: 5
+num_minibatches: 4
+learning_rate: 3.0e-4
+gamma: 0.99
+gae_lambda: 0.95
+clip_coef: 0.2
+ent_coef: 0.005
+vf_coef: 0.5
+max_grad_norm: 1.0
+init_std: 0.5
+level: 0
+curriculum: true
+mix: 0.2
+randomize: true
+eval_every: 2000000

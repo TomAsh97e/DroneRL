@@ -1,0 +1,21 @@
+# M3.10 ablation: only the mono profile
+exp: m3/student
+variant: mono
+history: stack3
+total_steps: 30000000
+num_envs: 2048
+num_steps: 32
+beta: 0.5
+buffer_size: 1000000
+batch_size: 4096
+updates: 32
+learning_rate: 3.0e-4
+level: 5
+mix: 0.2
+randomize: true
+eval_every: 2000000
+sensors:
+  mix: {mono: 1.0}
+  state_noise: true
+  tilt: true
+  latency: true

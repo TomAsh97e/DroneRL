@@ -1,4 +1,7 @@
-"""Steps per second of the GPU navigation environment with random actions and resets (M2.3)."""
+"""Steps per second of the GPU navigation environment with random actions and resets (M2.3).
+
+With --student also the observations of the student (M3.8).
+"""
 
 import argparse
 import json
@@ -7,12 +10,12 @@ from pathlib import Path
 
 import torch
 
-from dronerl.envs.nav_gpu import NavEnv, load_maps
+from dronerl.envs.nav_gpu import STUDENT, NavEnv, load_maps
 
 
-def measure(maps, num_envs, steps, device="cuda"):
+def measure(maps, num_envs, steps, device="cuda", student=None):
     # the densest level with the curriculum mix, as at the end of training
-    env = NavEnv(maps, num_envs, device, level=5, mix=0.2)
+    env = NavEnv(maps, num_envs, device, level=5, mix=0.2, randomize=True, student=student)
     env.reset()
     gen = torch.Generator(device).manual_seed(0)
     actions = [torch.rand(num_envs, 3, generator=gen, device=device) * 2 - 1 for _ in range(16)]
@@ -41,9 +44,11 @@ def main(argv=None):
     parser.add_argument("--envs", type=int, nargs="+", default=[1024, 4096, 16384])
     parser.add_argument("--steps", type=int, default=300)
     parser.add_argument("--out", type=Path, default=Path("runs/m2/throughput"))
+    parser.add_argument("--student", action="store_true")
     args = parser.parse_args(argv)
     maps = load_maps("train")
-    results = [measure(maps, n, args.steps) for n in args.envs]
+    student = STUDENT if args.student else None
+    results = [measure(maps, n, args.steps, student=student) for n in args.envs]
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "env.json").write_text(json.dumps(results, indent=2))
     lines = [
